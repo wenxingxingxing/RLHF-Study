@@ -568,3 +568,4 @@ FSDP 通过多层配置实现了通信和计算的精细控制，主要有三点
 1. [PyTorch FSDP 设计解读与性能分析](https://zhuanlan.zhihu.com/p/2006736398171017994)
 2. [FSDP详解：基础原理与源码解析](https://zhuanlan.zhihu.com/p/2003463581727995225)
 3. [图解大模型训练之：数据并行上篇(DP, DDP与ZeRO)](https://zhuanlan.zhihu.com/p/617133971)
+4. [数据并行Deep-dive: 从DP 到 Fully Sharded Data Parallel （FSDP）完全分片数据并行](https://zhuanlan.zhihu.com/p/485208899)
