@@ -114,7 +114,7 @@ class FeedForward(nn.Module):
 ## 1.3 MLP head 分类层
 MLP Head 是ViT 里用于分类的预测头，结构和代码如下，也是由LN 和线性层组成
 
-![alt text](./assets/1/1/5.png)
+![alt text](./assets/1/5.png)
 
 代码
 ```python
