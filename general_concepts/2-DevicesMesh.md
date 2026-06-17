@@ -35,10 +35,10 @@ device_mesh = init_device_mesh(
 
 ```
           GPU 0  GPU 1 | GPU 2  GPU 3 | GPU 4  GPU 5 | GPU 6  GPU 7
-DDP组0:  |  FSDP组  |   |        |        |
-DDP组1:  |          |   | FSDP组 |        |
-DDP组2:  |          |   |        | FSDP组 |
-DDP组3:  |          |   |        |        |  FSDP组
+DDP组0:  |  FSDP组  |   |              |             |
+DDP组1:  |          |   | FSDP组       |             |
+DDP组2:  |          |   |              | FSDP组      |
+DDP组3:  |          |   |              |             |  FSDP组
 ```
 
 - **第一维 (ddp)**：数据并行 — 不同 GPU 处理不同数据 batch

@@ -263,8 +263,9 @@ Qwen3 VL采用了Interleaved-MRoPE，其核心思想如下：
 
 在1D RoPE中，嵌入层分成了d/2组，每一对连续元素(x[2j], x[2j+1])视为一个二维子空间，j = 0, 1, ..., d/2 - 1。
 
-确定第
-个子空间应使用t、h、w中的哪一个轴进行旋转 采用轮询（Round‑Robin）分配
+确定第j个子空间应使用t、h、w中的哪一个轴进行旋转 采用轮询（Round‑Robin）分配
+
+$$axis(j) = j mod 3$$
 
 
 其中定义映射：0→t，1→h，2→w。因此：
@@ -280,6 +281,10 @@ Qwen3 VL采用了Interleaved-MRoPE，其核心思想如下：
 位置编码知识可参考：[《彻底搞懂RoPE计算原理：从1D到3D》](https://zhuanlan.zhihu.com/p/2023493768003724514)
 
 相关文章：[《VLM视觉-语言融合流程解析（Kimi K2.5/VL）》](https://zhuanlan.zhihu.com/p/2018404307385500510)
+
+# 七、 多模态任务中的一些问题？
+
+https://zhuanlan.zhihu.com/p/2001600068936041851
 
 
 # 参考
