@@ -553,11 +553,19 @@ if __name__ == "__main__":
 ```
 </details>
 
+面试加分点 (Tips)：
+
+1. 维度变换：一定要口述清楚 transpose(1, 2) 是为了把 num_heads 放到第二维，方便并行计算。
+2. Mask 的作用：在 LLM 预训练（Decoder-only）中，必须使用 Causal Mask 防止信息泄露（即预测第 t 个词时不能看到 t+1 及之后的词）。
+3. 为什么除以$\sqrt{d_k} $：防止点积过大，导致 Softmax 进入饱和区（梯度接近 0），训练变慢。
+4. Flash Attention：如果面试官问优化，可以提一句标准的 Attention 是 $O(N^2) $显存占用，而 FlashAttention 通过**分块计算（Tiling）和重计算（Recomputation）**减少了 HBM 访问，是推理加速的关键。
 
 <details>
 <summary>GQA代码实现</summary>
 
 ```python
+
+
 import torch
 import torch.nn as nn
 
@@ -694,10 +702,12 @@ if __name__ == "__main__":
 
 面试加分点 (Tips)：
 
-1. 维度变换：一定要口述清楚 transpose(1, 2) 是为了把 num_heads 放到第二维，方便并行计算。
-2. Mask 的作用：在 LLM 预训练（Decoder-only）中，必须使用 Causal Mask 防止信息泄露（即预测第 t 个词时不能看到 t+1 及之后的词）。
-3. 为什么除以$\sqrt{d_k} $：防止点积过大，导致 Softmax 进入饱和区（梯度接近 0），训练变慢。
-4. Flash Attention：如果面试官问优化，可以提一句标准的 Attention 是 $O(N^2) $显存占用，而 FlashAttention 通过**分块计算（Tiling）和重计算（Recomputation）**减少了 HBM 访问，是推理加速的关键。
+
+1. Expand 与 Repeat 的区别（内存优化）： 在代码 match_kv_to_q 函数中，强烈建议使用 unsqueeze + expand。面试官经常会问：“这里直接 copy 数据会造成显存浪费吗？”你可以回答：在 PyTorch 中，expand 底层仅仅是改变了 Tensor 的 stride 步长，多个 Query 头在计算时读取的是同一块物理内存（Zero-copy），这比使用 repeat 或 repeat_interleave（会触发物理内存分配）更高效。
+
+2. 实际工程中的 GQA： 在工业界真实的推理引擎（如 vLLM, TensorRT-LLM）中，其实根本不会在显存里把 K 和 V expand 出新维度。FlashAttention 等底层 Kernel 会通过 Block 索引映射 的方式，让多个 Q 的 block 直接去共享读取同一个 KV 的 block，从而把访存带宽（Memory Bandwidth）的消耗降到最低。
+
+3. 训练与推理的差异： GQA 在训练阶段（Prefill）其实并没有减少太多的计算量（FLOPs），因为主要的矩阵乘法维度没变。它的核心价值全在于推理的 Decoding 阶段——大幅减少了自回归生成时读取历史 KV Cache 所造成的 IO 瓶颈。
 
 
 
@@ -725,8 +735,8 @@ if __name__ == "__main__":
 <summary>ROPE前向计算</summary>
 
 ```python
-import numpy as np
- 
+import torch
+
 def precompute_freqs_cis(dim, max_seq_len, theta=10000.0):
     """
     预计算旋转角度的 cos 和 sin 值（复数形式常称为 cis，即 cos + i sin）
@@ -734,23 +744,26 @@ def precompute_freqs_cis(dim, max_seq_len, theta=10000.0):
     max_seq_len: 最大序列长度
     theta: base 频率参数，通常为 10000
     返回:
-        cos: (max_seq_len, dim//2)
-        sin: (max_seq_len, dim//2)
+        cos: (max_seq_len, dim/2)
+        sin: (max_seq_len, dim/2)
     """
     assert dim % 2 == 0, "维度必须为偶数"
+    
     # 计算每个维度的频率 theta_i
-    i = np.arange(0, dim, 2)  # i = 0, 2, 4, ..., dim-2
-    freqs = 1.0 / (theta ** (i / dim))  # (dim//2,)
- 
+    # 注意：PyTorch 中这里需要指定 dtype=torch.float32，否则整数类型无法直接参与某些指数/除法运算
+    i = torch.arange(0, dim, 2, dtype=torch.float32)  # i = 0, 2, 4, ..., dim-2
+    freqs = 1.0 / (theta ** (i / dim))  # (dim/2,)
+
     # 生成位置序列
-    t = np.arange(max_seq_len)  # (max_seq_len,)
-    # 计算角度 t * freqs (广播)
-    angles = np.outer(t, freqs)  # (max_seq_len, dim//2)
- 
-    cos = np.cos(angles)  # (max_seq_len, dim//2)
-    sin = np.sin(angles)  # (max_seq_len, dim//2)
+    t = torch.arange(max_seq_len, dtype=torch.float32)  # (max_seq_len,)
+    
+    # 计算角度 t * freqs (外积)
+    angles = torch.outer(t, freqs)  # (max_seq_len, dim/2)
+
+    cos = torch.cos(angles)  # (max_seq_len, dim/2)
+    sin = torch.sin(angles)  # (max_seq_len, dim//2)
     return cos, sin
- 
+
 def apply_rotary_emb(x, cos, sin):
     """
     对输入张量 x 应用旋转位置编码
@@ -759,64 +772,64 @@ def apply_rotary_emb(x, cos, sin):
     返回: 编码后的张量，形状与 x 相同
     """
     # 将 x 按最后一维分成两半，reshape 成 (..., seq_len, dim//2, 2)
-    # 这样最后一维的两个元素分别是 x_{2i} 和 x_{2i+1}
     orig_shape = x.shape
     seq_len = x.shape[-2]  # 倒数第二维是序列长度
     d = x.shape[-1]
     assert d % 2 == 0
+    
     # 将 x 重塑为 (..., seq_len, d//2, 2)
-    x_reshaped = x.reshape(*orig_shape[:-1], d//2, 2)
- 
+    x_reshaped = x.reshape(*orig_shape[:-1], d // 2, 2)
+
     # 分别取出偶数索引和奇数索引部分（即两个分量）
     x_even = x_reshaped[..., 0]  # (..., seq_len, d//2)
     x_odd  = x_reshaped[..., 1]  # (..., seq_len, d//2)
- 
+
     # 应用旋转公式：
-    # x'_{2i} = x_{2i} * cos - x_{2i+1} * sin
-    # x'_{2i+1} = x_{2i} * sin + x_{2i+1} * cos
     # 注意 cos, sin 的形状为 (seq_len, d//2)，需要广播到与 x_even 一致
-    # 如果 x 有 batch 维度，cos/sin 会自动广播到 batch 维（只要维度对齐）
+    # PyTorch 的广播机制与 NumPy 一致，自动支持前置 Batch 维度
     rotated_even = x_even * cos - x_odd * sin
     rotated_odd  = x_even * sin + x_odd * cos
- 
+
     # 将两部分堆叠回 (..., seq_len, d//2, 2) 形状
-    rotated = np.stack([rotated_even, rotated_odd], axis=-1)  # (..., seq_len, d//2, 2)
+    # numpy.stack(axis=-1) 对应 torch.stack(dim=-1)
+    rotated = torch.stack([rotated_even, rotated_odd], dim=-1)  # (..., seq_len, d//2, 2)
+    
     # 重塑回原始形状 (..., seq_len, d)
     return rotated.reshape(*orig_shape)
- 
+
 # ========== 示例运行 ==========
 if __name__ == "__main__":
     # 参数
     dim = 8
     seq_len = 4
     batch_size = 2
- 
+
     # 预计算 cos 和 sin
     cos, sin = precompute_freqs_cis(dim, seq_len)
-    print("cos 形状:", cos.shape)  # (4, 4) 因为 dim//2 = 4
+    print("cos 形状:", cos.shape)  # torch.Size([4, 4]) 因为 dim//2 = 4
     print("sin 形状:", sin.shape)
- 
+
     # 随机生成 Query 和 Key（假设无 batch 或带 batch）
     # 示例 1: 单序列
-    q = np.random.randn(seq_len, dim)
-    k = np.random.randn(seq_len, dim)
+    q = torch.randn(seq_len, dim)
+    k = torch.randn(seq_len, dim)
     q_rot = apply_rotary_emb(q, cos, sin)
     k_rot = apply_rotary_emb(k, cos, sin)
     print("\n单序列 RoPE 后 Q 形状:", q_rot.shape)
- 
+
     # 示例 2: 带 batch 的序列
-    q_batch = np.random.randn(batch_size, seq_len, dim)
-    k_batch = np.random.randn(batch_size, seq_len, dim)
+    q_batch = torch.randn(batch_size, seq_len, dim)
+    k_batch = torch.randn(batch_size, seq_len, dim)
     q_batch_rot = apply_rotary_emb(q_batch, cos, sin)
     k_batch_rot = apply_rotary_emb(k_batch, cos, sin)
     print("带 batch 的 RoPE 后 Q 形状:", q_batch_rot.shape)
- 
+
     # 验证内积是否只与相对位置有关（理论性质，这里简单打印差值）
-    # 取位置 1 和 2 的 Q/K 计算内积，并与位置 2 和 3 的比较（未严格验证，仅供演示）
-    attn1 = np.dot(q_rot[1], k_rot[2])
-    attn2 = np.dot(q_rot[2], k_rot[3])
-    print(f"内积 (pos1 Q, pos2 K): {attn1:.4f}")
-    print(f"内积 (pos2 Q, pos3 K): {attn2:.4f}")
+    # PyTorch 计算一维张量的内积使用 torch.dot，并用 .item() 提取标量数值
+    attn1 = torch.dot(q_rot[1], k_rot[2])
+    attn2 = torch.dot(q_rot[2], k_rot[3])
+    print(f"内积 (pos1 Q, pos2 K): {attn1.item():.4f}")
+    print(f"内积 (pos2 Q, pos3 K): {attn2.item():.4f}")
 
 ```
 </details>
@@ -841,6 +854,120 @@ Llama 2/3 使用了 10000，但为了支持更长上下文，Llama 3 或某些�
 一个问题：为什么位置编码要同时使用 sin 和 cos，而不是只使用其中一个？
 
 因为 RoPE（旋转位置编码）的本质是在复数平面（或二维空间）上对词向量进行旋转（Rotation）。在数学上，要完成一次保范数（Norm-preserving）的二维旋转，必须同时依赖正弦和余弦的配合；如果只用其中一个，就变成了破坏向量长度的单纯缩放（Scaling）。
+
+
+
+# LoRA
+
+```python
+import torch
+import torch.nn as nn
+import math
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, r: int = 8, lora_alpha: int = 16, dropout: float = 0.05):
+        super().__init__()
+        
+        # 1. 原始的预训练权重层（冻结参数）
+        self.pretrained = nn.Linear(in_features, out_features)
+        # 冻结原始参数，不计算梯度
+        self.pretrained.weight.requires_grad = False
+        if self.pretrained.bias is not None:
+            self.pretrained.bias.requires_grad = False
+            
+        # 2. LoRA 参数配置
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = self.lora_alpha / self.r  # 缩放因子
+        
+        # 3. 创建 LoRA 的 A 和 B 矩阵（注意：不需要 bias）
+        # A 是降维矩阵: [in_features, r]
+        self.lora_A = nn.Linear(in_features, r, bias=False)
+        # B 是升维矩阵: [r, out_features]
+        self.lora_B = nn.Linear(r, out_features, bias=False)
+        
+        self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
+        
+        # 4. 初始化 LoRA 参数 (面试极高频考点)
+        self.reset_parameters()
+        
+        # 标记是否已经将 LoRA 权重合并到基础权重中 (推理时用)
+        self.merged = False
+
+    def reset_parameters(self):
+        """
+        初始化策略至关重要：
+        A 矩阵：使用随机初始化（如 Kaiming 正态/均匀分布）
+        B 矩阵：必须初始化为全 0！
+        """
+        if hasattr(self, 'lora_A'):
+            # 也可以用 nn.init.normal_(self.lora_A.weight)
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 如果已经合并了权重（推理模式），直接走一条路即可
+        if self.merged:
+            return self.pretrained(x)
+            
+        # 训练模式：
+        # 1. 主干链路计算 (冻结的 W0)
+        base_out = self.pretrained(x)
+        
+        # 2. LoRA 旁路计算 (Dropout -> A -> B -> Scale)
+        lora_out = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        
+        # 3. 结果相加
+        return base_out + lora_out
+
+    def merge_weights(self):
+        """
+        部署推理时调用：将 B*A 的结果加到原始权重 W0 上，消除推理延迟
+        """
+        if not self.merged and self.r > 0:
+            # lora_B.weight shape: [out_features, r]
+            # lora_A.weight shape: [r, in_features]
+            # BA shape: [out_features, in_features]
+            BA = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+            self.pretrained.weight.data += BA
+            self.merged = True
+
+    def unmerge_weights(self):
+        """恢复分离状态，主要用于继续训练等特殊场景"""
+        if self.merged and self.r > 0:
+            BA = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+            self.pretrained.weight.data -= BA
+            self.merged = False
+
+
+# ========== 测试代码 ==========
+if __name__ == "__main__":
+    batch_size, seq_len, in_dim, out_dim = 2, 16, 512, 1024
+    x = torch.randn(batch_size, seq_len, in_dim)
+    
+    # 实例化并观察初始化输出
+    lora_layer = LoRALinear(in_features=in_dim, out_features=out_dim, r=8)
+    
+    # 验证初始状态下，LoRA 旁路应该输出全 0，所以等同于原始 Linear 输出
+    out_initial = lora_layer(x)
+    base_out = lora_layer.pretrained(x)
+    print("初始状态下输出差异的最大值 (应为 0):", (out_initial - base_out).abs().max().item())
+```
+
+
+
+1. 为什么 lora_B 必须要初始化为全 0？
+答案： 为了保证在训练开始的第 0 步，$\Delta W = B \times A = 0$。这样模型在加上 LoRA 模块后的初始输出，和没加之前完全一模一样。如果不初始化为 0，相当于在原本预训练好的完美模型上注入了巨大的随机噪声，会导致刚开始训练时 loss 爆炸。
+
+2. 为什么不用 B 随机，A 为全 0？
+
+答案： 数学上虽然 $A=0$ 也能让 $BA=0$，但在反向传播时，如果 $A$ 初始为 0，那传给它的梯度可以正常计算，但是传给 $B$ 的梯度（由于链式法则包含 $A$）就会变成 0，导致 $B$ 第一步无法更新。让 $A$ 随机、$B$ 为零可以确保梯度正常流通。
+
+3. 代码中的 lora_alpha ( scaling ) 是干什么用的？为什么是 $\frac{\alpha}{r}$ 而不是直接设一个学习率？
+
+答案： 主要是为了解耦秩 $r$ 和学习率。当我们在调参时改变了 $r$（比如从 8 调到 16），那么 $B \times A$ 矩阵乘法求和的项数增加了一倍，导致激活值的方差变大。除以 $r$ 可以将方差拉回同一个量级；乘以一个常数 $\alpha$ 可以方便地控制 LoRA 更新步长的整体幅度。通常在使用中，无论 $r$ 取多少，我们直接固定 $\alpha$（例如 $\alpha = 16$），就可以避免每次改 $r$ 都要重新去调优学习率。
+
+
 
 写 PPO DPO GRPO 的 loss function。
 写 PPO 伪代码、PPO 的 GAE。
